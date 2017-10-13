@@ -1,6 +1,6 @@
-# cs640
+# CS640
 
-This respository contains programming assignments for the course Introduction to Computer Networks
+This repository contains programming assignments for the course Introduction to Computer Networks
 taken during the Fall of 2017 at the University of Wisconsin-Madison.
 
 # Learning Switch - Programming Assignment 1
