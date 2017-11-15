@@ -4,6 +4,7 @@
   Basic IPv4 router for the Computer Networks course CS640
 '''
 
+import time
 from switchyard.lib.userlib import *
 
 
@@ -56,7 +57,8 @@ class Router(object):
 
         ip = IPv4()
         ip.src, ip.dst = ip_payload.dst, ip_payload.src
-        ip.ttl = ip_payload.ttl
+        ip.ttl = 64
+        # ip.ttl = ip_payload.ttl
 
         icmp = ICMP()
         icmp.icmptype = icmp_type
@@ -130,17 +132,23 @@ class Router(object):
             eth_payload = pkt.get_header(Ethernet)
             eth_payload.src = intf.ethaddr
             eth_payload.dst = self.arp_table[next_hop_ip]
+
+            pkt[IPv4].ttl -= 1
+            if pkt[IPv4].ttl <= 0:
+                raise TTLExpiredException("TTL has expired")
+
             self.net.send_packet(dev, pkt)
         else:
             arprequest = Router.make_arp_request(intf.ethaddr, intf.ipaddr,
                                                  next_hop_ip)
 
-            self.arp_requests.setdefault(next_hop_ip, [dev, arprequest, 0])
-            self.arp_requests[next_hop_ip][-1] += 1
-            self.packets_queue.setdefault(next_hop_ip, [])
-            if pkt not in self.packets_queue[next_hop_ip]:
-                self.packets_queue[next_hop_ip].append(pkt)
-            self.net.send_packet(dev, arprequest)
+            if next_hop_ip not in self.arp_requests:
+                self.arp_requests[next_hop_ip] = [dev, arprequest,
+                                                  time.time(), 0]
+                self.packets_queue.setdefault(next_hop_ip, [])
+                if pkt not in self.packets_queue[next_hop_ip]:
+                    self.packets_queue[next_hop_ip].append(pkt)
+                self.net.send_packet(dev, arprequest)
 
     def icmp_error_handler(self, pkt, icmp_type, icmp_code, error_message):
         log_debug(error_message)
@@ -149,6 +157,31 @@ class Router(object):
                                      icmp_code=icmp_code)
         self.forward_packet(next_hop_dev, next_hop_ip, pkt)
 
+    def clear_arp_requests(self):
+        to_remove = []
+        for ipaddr, value in self.arp_requests.items():
+            dev, arprequest, time_sent, num_requests = value
+            if num_requests >= 5:
+                to_remove.append(ipaddr)
+            else:
+                cur_time = time.time()
+                if cur_time - time_sent > 1.0:
+                    self.net.send_packet(dev, arprequest)
+                    self.arp_requests[ipaddr][-2] = cur_time
+                    self.arp_requests[ipaddr][-1] += 1
+
+        for ipaddr in to_remove:
+            self.arp_requests.pop(ipaddr)
+            # for all packets in the packets_queue waiting for this
+            # arp response, generate an ICMP error message
+            for pkt in self.packets_queue[ipaddr]:
+                self.icmp_error_handler(
+                    pkt, ICMPType.DestinationUnreachable,
+                    ICMPCodeDestinationUnreachable.HostUnreachable,
+                    "Unable to get ARP response even after 5 retries"
+                )
+            self.packets_queue.pop(ipaddr)
+
     def router_main(self):    
         '''
         Main method for router; we stay in a loop in this method, receiving
@@ -156,7 +189,11 @@ class Router(object):
         '''
         while True:
             gotpkt = True
+
             try:
+                # Clear ARP requests
+                self.clear_arp_requests()
+
                 timestamp, dev, pkt = self.net.recv_packet(timeout=1.0)
                 eth_payload = pkt.get_header(Ethernet)
                 if eth_payload.ethertype == EtherType.ARP:
@@ -189,10 +226,6 @@ class Router(object):
 
                 elif eth_payload.ethertype == EtherType.IP:
                     ip_payload = pkt.get_header(IPv4)
-                    ip_payload.ttl -= 1
-
-                    if ip_payload.ttl <= 0:
-                        raise TTLExpiredException("TTL has expired")
 
                     # Have to route the pkt
                     dst_ip = ip_payload.dst
@@ -216,27 +249,6 @@ class Router(object):
             except NoPackets:
                 log_debug("No packets available in recv_packet")
                 gotpkt = False
-                # take care of the ARP requesting here.
-                to_remove = []
-                for ipaddr, value in self.arp_requests.items():
-                    dev, arprequest, num_requests = value
-                    if num_requests >= 5:
-                        to_remove.append(ipaddr)
-                    else:
-                        self.net.send_packet(dev, arprequest)
-                        self.arp_requests[ipaddr][-1] += 1
-
-                for ipaddr in to_remove:
-                    self.arp_requests.pop(ipaddr)
-                    # for all packets in the packets_queue waiting for this
-                    # arp response, generate an ICMP error message
-                    for pkt in self.packets_queue[ipaddr]:
-                        self.icmp_error_handler(
-                            pkt, ICMPType.DestinationUnreachable,
-                            ICMPCodeDestinationUnreachable.HostUnreachable,
-                            "Unable to get ARP response even after 5 retries"
-                        )
-                    self.packets_queue.pop(ipaddr)
 
             except Shutdown:
                 log_debug("Got shutdown signal")
