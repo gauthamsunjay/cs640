@@ -10,7 +10,8 @@ from switchyard.lib.userlib import *
 
 class Router(object):
     def __init__(self, net, static_table):
-        # initialization done here
+        # Initializing the router
+        log_info("Initializing router.. ")
         self.net = net
         self.forwarding_table = Router.parse_forwaring_table(static_table)
         self.ips = self.get_intf_ips()
@@ -21,9 +22,11 @@ class Router(object):
 
     @staticmethod
     def parse_forwaring_table(static_file):
+        # Parses the forwarding table
         forwarding_table = {}
         with open(static_file, 'r') as fp:
-            for line in fp.readlines():
+            data = fp.read().strip().split("\n")
+            for line in data:
                 net, subnet, next_hop, eth_port = line.strip().split()
                 forwarding_table[IPAddr(net)] = (IPAddr(subnet),
                                                  IPAddr(next_hop), eth_port)
@@ -32,6 +35,7 @@ class Router(object):
 
     @staticmethod
     def make_arp_request(senderhwaddr, senderprotoaddr, targetprotoaddr):
+        # Creates the ARP request
         ether = Ethernet()
         ether.src = senderhwaddr
         ether.dst = 'ff:ff:ff:ff:ff:ff'
@@ -48,6 +52,7 @@ class Router(object):
     @staticmethod
     def make_icmp_reply(pkt, icmp_type=ICMPType.EchoReply,
                         icmp_code=ICMPCodeEchoReply.EchoReply):
+        # Creates ICMP reply
         eth_payload = pkt.get_header(Ethernet)
         ip_payload = pkt.get_header(IPv4)
         icmp_payload = pkt.get_header(ICMP)
@@ -58,7 +63,6 @@ class Router(object):
         ip = IPv4()
         ip.src, ip.dst = ip_payload.dst, ip_payload.src
         ip.ttl = 64
-        # ip.ttl = ip_payload.ttl
 
         icmp = ICMP()
         icmp.icmptype = icmp_type
@@ -113,13 +117,14 @@ class Router(object):
 
         matches = sorted(matches, key=lambda x: x[0], reverse=True)
         try:
+            log_info("Next hop: %s" % str(matches[0][1]))
             return matches[0][1]
         except IndexError:
             raise NoMatchFoundException(
                 "Network not found in the forwarding table"
             )
 
-    def forward_packet(self, dev, next_hop_ip, pkt):
+    def forward_packet(self, dev, next_hop_ip, pkt, change_ip_src=False):
         # Forwards packet if eth address is known, else makes arp request
         if next_hop_ip in self.ips:
             ip_payload = pkt.get_header(IPv4)
@@ -133,10 +138,18 @@ class Router(object):
             eth_payload.src = intf.ethaddr
             eth_payload.dst = self.arp_table[next_hop_ip]
 
-            pkt[IPv4].ttl -= 1
-            if pkt[IPv4].ttl <= 0:
+            ip_payload = pkt[IPv4]
+            if change_ip_src:
+                ip_payload.src = intf.ipaddr
+
+            try:
+                ip_payload.ttl -= 1
+                if ip_payload.ttl <= 0:
+                    raise TTLExpiredException("TTL has expired")
+            except ValueError:
                 raise TTLExpiredException("TTL has expired")
 
+            log_info("Forwarding Packet: %s" % pkt)
             self.net.send_packet(dev, pkt)
         else:
             arprequest = Router.make_arp_request(intf.ethaddr, intf.ipaddr,
@@ -144,18 +157,18 @@ class Router(object):
 
             if next_hop_ip not in self.arp_requests:
                 self.arp_requests[next_hop_ip] = [dev, arprequest,
-                                                  time.time(), 0]
+                                                  time.time(), 1]
                 self.packets_queue.setdefault(next_hop_ip, [])
                 if pkt not in self.packets_queue[next_hop_ip]:
                     self.packets_queue[next_hop_ip].append(pkt)
                 self.net.send_packet(dev, arprequest)
 
     def icmp_error_handler(self, pkt, icmp_type, icmp_code, error_message):
-        log_debug(error_message)
+        log_info(error_message)
         next_hop_ip, next_hop_dev = self.find_next_hop(pkt[IPv4].src)
         pkt = Router.make_icmp_reply(pkt, icmp_type=icmp_type,
                                      icmp_code=icmp_code)
-        self.forward_packet(next_hop_dev, next_hop_ip, pkt)
+        self.forward_packet(next_hop_dev, next_hop_ip, pkt, change_ip_src=True)
 
     def clear_arp_requests(self):
         to_remove = []
@@ -165,7 +178,16 @@ class Router(object):
                 to_remove.append(ipaddr)
             else:
                 cur_time = time.time()
+                log_info("Elapsed time between ARP request = %f" %
+                         (cur_time - time_sent))
                 if cur_time - time_sent > 1.0:
+                    log_info(
+                        "Resending ARP request for %s %d time. Pkt: %s"
+                        % (
+                            ipaddr, self.arp_requests[ipaddr][-1] + 1,
+                            arprequest
+                        )
+                    )
                     self.net.send_packet(dev, arprequest)
                     self.arp_requests[ipaddr][-2] = cur_time
                     self.arp_requests[ipaddr][-1] += 1
@@ -214,15 +236,14 @@ class Router(object):
                         # update ARP table
                         self.arp_table[ipaddr] = ethaddr
 
+                        self.arp_requests.pop(ipaddr)
                         # iterate over all packets waiting for this arp resp
-                        for pkt in self.packets_queue[ipaddr]:
+                        pkts = self.packets_queue.pop(ipaddr, [])
+                        for pkt in pkts:
                             next_hop_ip, next_hop_dev = self.find_next_hop(
                                 pkt.get_header(IPv4).dst
                             )
                             self.forward_packet(next_hop_dev, next_hop_ip, pkt)
-
-                        self.packets_queue.pop(ipaddr)
-                        self.arp_requests.pop(ipaddr)
 
                 elif eth_payload.ethertype == EtherType.IP:
                     ip_payload = pkt.get_header(IPv4)
